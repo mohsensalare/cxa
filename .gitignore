@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# never let a token snapshot near this repo
+auth.json
+accounts/
+*.usage.json
+*.meta.json

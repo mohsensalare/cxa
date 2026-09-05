@@ -1,0 +1,805 @@
+#!/usr/bin/env python3
+"""cxa - switch between Codex CLI logins.
+
+Codex keeps exactly one signed-in account in ~/.codex/auth.json. cxa snapshots
+that file per account and swaps it back in on demand, so changing accounts costs
+no browser round trip and never needs `codex logout`.
+
+It also reads the rate-limit windows Codex records in its own session logs, so
+`cxa status` can show how much of each account is left and `cxa auto` can move
+you to the one with the most headroom.
+
+No dependencies, no network calls, and Codex's own configuration is never
+touched - cxa is invisible to it.
+"""
+
+from __future__ import annotations
+
+import base64
+import calendar
+import glob
+import json
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import time
+import tty
+from dataclasses import dataclass
+from typing import Any, Iterable, NamedTuple
+
+# --------------------------------------------------------------------- settings
+
+CODEX_HOME = os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))
+AUTH = os.path.join(CODEX_HOME, "auth.json")
+SESSIONS = os.path.join(CODEX_HOME, "sessions")
+
+STORE = os.path.join(CODEX_HOME, "accounts")
+JOURNAL = os.path.join(STORE, ".journal.jsonl")
+STATE = os.path.join(STORE, ".state.json")
+
+#: A window at or above this percent counts as spent. Lower it to rotate sooner.
+FULL = float(os.environ.get("CXA_FULL", 100))
+
+#: Windows no longer than this are the short, fast-refilling kind (Codex uses 5h).
+SHORT_WINDOW_MINUTES = 1440
+
+#: Session logs run to tens of megabytes, so only their tail is ever read.
+TAIL_BYTES = 400_000
+MAX_LOGS_PER_SCAN = 120
+
+DIM, GREEN, YELLOW, RED, BOLD, OFF = (
+    "\033[2m", "\033[32m", "\033[33m", "\033[31m", "\033[1m", "\033[0m",
+)
+if not sys.stdout.isatty():
+    DIM = GREEN = YELLOW = RED = BOLD = OFF = ""
+
+ANSI = re.compile(r"\033\[[0-9;]*[A-Za-z]")
+
+
+def die(message: str) -> "NoReturn":  # noqa: F821 - quoted for 3.8 compatibility
+    sys.exit(f"cxa: {message}")
+
+
+def read_json(path: str, default: Any = None) -> Any:
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {} if default is None else default
+
+
+def write_json(path: str, payload: Any) -> None:
+    os.makedirs(STORE, mode=0o700, exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(payload, fh)
+    os.chmod(path, 0o600)
+
+
+# ---------------------------------------------------------------------- accounts
+
+
+@dataclass(frozen=True)
+class Account:
+    name: str
+    path: str
+    email: str
+    plan: str
+    account_id: str
+
+
+def read_identity(path: str) -> "tuple[str, str, str]":
+    """(email, plan, account_id) for an auth.json, read straight from its id_token."""
+    data = read_json(path)
+    if not data:
+        return ("(unreadable)", "-", "")
+    tokens = data.get("tokens") or {}
+    email = plan = ""
+    parts = (tokens.get("id_token") or "").split(".")
+    if len(parts) > 1:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        try:
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            email = claims.get("email") or ""
+            plan = (claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type") or ""
+        except (ValueError, TypeError):
+            pass
+    if not email and data.get("OPENAI_API_KEY"):
+        email, plan = "api key", "apikey"
+    return (email or "?", plan or data.get("auth_mode") or "-", tokens.get("account_id") or "")
+
+
+def list_accounts() -> "list[Account]":
+    os.makedirs(STORE, mode=0o700, exist_ok=True)
+    found = []
+    for entry in sorted(os.listdir(STORE)):
+        if not entry.endswith(".json") or entry.startswith("."):
+            continue
+        if entry.endswith((".usage.json", ".meta.json")):
+            continue
+        path = os.path.join(STORE, entry)
+        found.append(Account(entry[: -len(".json")], path, *read_identity(path)))
+    return found
+
+
+def find_account(name: str) -> Account:
+    for account in list_accounts():
+        if account.name == name:
+            return account
+    die(f"unknown account '{name}'")
+
+
+def active_id() -> str:
+    return read_identity(AUTH)[2] if os.path.exists(AUTH) else ""
+
+
+def sync_active() -> None:
+    """Codex refreshes tokens in place, so freshen the stored copy before any swap."""
+    current = active_id()
+    if not current:
+        return
+    for account in list_accounts():
+        if account.account_id == current:
+            try:
+                if open(account.path, "rb").read() != open(AUTH, "rb").read():
+                    shutil.copyfile(AUTH, account.path)
+            except OSError:
+                pass
+            return
+
+
+def running_codex() -> "tuple[list[int], bool]":
+    """(cli pids, desktop app running). The ChatGPT app ships a dozen helper
+    processes with `codex` in their path, so only its bundle is counted, once."""
+    try:
+        listing = subprocess.run(["ps", "-Ao", "pid=,comm="], capture_output=True,
+                                 text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ([], False)
+    cli, app = [], False
+    for line in listing.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if ".app/" in command.lower() or "/Contents/" in command:
+            app = app or bool(re.search(r"/(ChatGPT|Codex)\.app/", command))
+            continue
+        if os.path.basename(command) == "codex" and pid.isdigit():
+            cli.append(int(pid))
+    return (cli, app)
+
+
+def warn_if_codex_running() -> bool:
+    """A live session keeps using the token it already loaded, so a swap under it
+    is at best ignored and at worst written back over. Returns False to abort."""
+    cli, app = running_codex()
+    if not cli and not app:
+        return True
+    if app and not cli:
+        print(f"{YELLOW}note{OFF} the Codex desktop app is running; it keeps the old "
+              f"login until you restart it")
+        return True
+    plural = "s" if len(cli) > 1 else ""
+    print(f"{YELLOW}warning{OFF} {len(cli)} codex CLI session{plural} running "
+          f"(pid {', '.join(str(p) for p in cli)})")
+    if os.environ.get("CXA_YES") or not sys.stdin.isatty():
+        return True
+    try:
+        return input("switch anyway? [y/N] ").strip().lower().startswith("y")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def save_active(name: "str | None" = None) -> None:
+    if not os.path.exists(AUTH):
+        die("not logged in - run `cxa login` first")
+    email = read_identity(AUTH)[0]
+    if not name:
+        stem = email.split("@")[0].lower()
+        name = "".join(c if c.isalnum() or c in "._-" else "-" for c in stem).strip("-.")
+    if not name:
+        die("could not derive a name from the login, pass one: cxa save <name>")
+    os.makedirs(STORE, mode=0o700, exist_ok=True)
+    destination = os.path.join(STORE, name + ".json")
+    shutil.copyfile(AUTH, destination)
+    os.chmod(destination, 0o600)
+    record_switch(name)
+    print(f"{GREEN}saved{OFF} {name}  {DIM}{email}{OFF}")
+
+
+def activate(name: str) -> None:
+    account = find_account(name)
+    if not warn_if_codex_running():
+        print("cancelled")
+        return
+    sync_active()
+    shutil.copyfile(account.path, AUTH)
+    os.chmod(AUTH, 0o600)
+    record_switch(name)
+    print(f"{GREEN}->{OFF} {name}  {DIM}{account.email}{OFF}")
+
+
+def login(name: "str | None" = None) -> None:
+    if not shutil.which("codex"):
+        die("codex CLI not found in PATH")
+    sync_active()
+    if os.path.exists(AUTH):
+        os.remove(AUTH)
+    subprocess.run(["codex", "login"])
+    if os.path.exists(AUTH):
+        save_active(name)
+    else:
+        print("cxa: login did not complete, nothing saved")
+
+
+def forget(name: str) -> None:
+    find_account(name)
+    for suffix in (".json", ".usage.json", ".meta.json"):
+        try:
+            os.remove(os.path.join(STORE, name + suffix))
+        except OSError:
+            pass
+    print(f"removed {name}")
+
+
+# ------------------------------------------------------------------ rate limits
+#
+# Codex writes its rate-limit windows into its own session logs but never records
+# which account they belong to. cxa therefore journals every switch it makes and
+# attributes each observation to whichever account was active at that moment.
+
+
+def journal_entries() -> "list[dict]":
+    try:
+        with open(JOURNAL) as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+    except (OSError, ValueError):
+        return []
+
+
+def record_switch(name: str) -> None:
+    entries = journal_entries()
+    if not entries:
+        # First run: everything logged so far belongs to whatever is active now.
+        write_json(JOURNAL + ".tmp", {})
+        os.remove(JOURNAL + ".tmp")
+        with open(JOURNAL, "w") as fh:
+            fh.write(json.dumps({"t": 0, "name": name}) + "\n")
+        os.chmod(JOURNAL, 0o600)
+        return
+    if entries[-1]["name"] != name:
+        with open(JOURNAL, "a") as fh:
+            fh.write(json.dumps({"t": int(time.time()), "name": name}) + "\n")
+
+
+def account_at(when: int, entries: "list[dict]") -> "str | None":
+    name = None
+    for entry in entries:
+        if entry["t"] > when:
+            break
+        name = entry["name"]
+    return name
+
+
+def latest_limits_in(path: str) -> "tuple[int, dict] | None":
+    """Newest (timestamp, rate_limits) in one session log, reading only its tail."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(max(0, os.path.getsize(path) - TAIL_BYTES))
+            tail = fh.read()
+    except OSError:
+        return None
+    for line in reversed(tail.split(b"\n")):
+        if b'"used_percent"' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        limits = (record.get("payload") or {}).get("rate_limits") or {}
+        if not (limits.get("primary") or limits.get("secondary")):
+            continue
+        try:
+            stamp = calendar.timegm(time.strptime(record["timestamp"][:19], "%Y-%m-%dT%H:%M:%S"))
+        except (KeyError, ValueError):
+            stamp = int(os.path.getmtime(path))
+        return (stamp, limits)
+    return None
+
+
+def refresh_usage() -> None:
+    """Fold newly written session logs into one usage snapshot per account."""
+    entries = journal_entries()
+    if not entries:
+        current = active_id()
+        for account in list_accounts():
+            if account.account_id and account.account_id == current:
+                record_switch(account.name)
+                entries = journal_entries()
+                break
+
+    since = read_json(STATE).get("last_scan", 0)
+    logs = [
+        path
+        for path in glob.glob(os.path.join(SESSIONS, "*", "*", "*", "rollout-*.jsonl"))
+        if os.path.getmtime(path) >= since - 60
+    ]
+    logs.sort(key=os.path.getmtime)
+
+    newest: "dict[str, tuple[int, dict]]" = {}
+    for path in logs[-MAX_LOGS_PER_SCAN:]:
+        found = latest_limits_in(path)
+        if not found:
+            continue
+        stamp, limits = found
+        name = account_at(stamp, entries)
+        if name and stamp >= newest.get(name, (0, {}))[0]:
+            newest[name] = (stamp, limits)
+
+    for name, (stamp, limits) in newest.items():
+        path = os.path.join(STORE, name + ".usage.json")
+        if read_json(path).get("observed_at", 0) > stamp:
+            continue  # a manual reset is more current than the log
+        write_json(path, {"observed_at": stamp, **limits})
+    write_json(STATE, {"last_scan": int(time.time())})
+
+
+class Window(NamedTuple):
+    percent: "float | None" = None
+    resets_at: "int | None" = None
+    minutes: "int | None" = None
+
+    @property
+    def known(self) -> bool:
+        return self.percent is not None
+
+
+class Limits(NamedTuple):
+    short: Window
+    long: Window
+    observed_at: "int | None"
+
+    @property
+    def windows(self) -> "tuple[Window, Window]":
+        return (self.short, self.long)
+
+    @property
+    def next_reset(self) -> "int | None":
+        upcoming = [w.resets_at for w in self.windows if w.resets_at]
+        return min(upcoming) if upcoming else None
+
+
+def limits_for(name: str) -> Limits:
+    """Windows sorted by length, not by Codex's primary/secondary keys - which of
+    those two holds the 5h window differs from account to account. A window past
+    its reset time counts as empty again."""
+    snapshot = read_json(os.path.join(STORE, name + ".usage.json"))
+    slots = {"short": Window(), "long": Window()}
+    for key in ("primary", "secondary"):
+        raw = snapshot.get(key)
+        if not raw or raw.get("used_percent") is None:
+            continue
+        minutes = raw.get("window_minutes") or 0
+        slot = "short" if minutes <= SHORT_WINDOW_MINUTES else "long"
+        resets_at = raw.get("resets_at") or 0
+        if resets_at and resets_at <= time.time():
+            slots[slot] = Window(0.0, None, minutes)
+        else:
+            slots[slot] = Window(raw["used_percent"], resets_at or None, minutes)
+    return Limits(slots["short"], slots["long"], snapshot.get("observed_at"))
+
+
+# -------------------------------------------------------------------- rotation
+
+READY, UNUSED, RESERVE, SPENT = range(4)
+TIER_LABELS = {READY: "", UNUSED: "unused", RESERVE: "reserve", SPENT: "spent"}
+
+
+def tier(name: str) -> int:
+    """Short windows refill every few hours, so spend those accounts first and
+    keep a weekly-only account in reserve for when they run dry."""
+    limits = limits_for(name)
+    if any(w.known and w.percent >= FULL for w in limits.windows):
+        return SPENT
+    if limits.short.known:
+        return READY
+    return RESERVE if limits.long.known else UNUSED
+
+
+def rank_key(name: str) -> tuple:
+    """Order accounts best-first: tier, then the 5h window, then the weekly one."""
+    limits = limits_for(name)
+    return (tier(name), limits.short.percent or 0.0, limits.long.percent or 0.0, name)
+
+
+def best_first(accounts: "Iterable[Account]") -> "list[Account]":
+    return sorted(accounts, key=lambda a: rank_key(a.name))
+
+
+# --------------------------------------------------------- manual reset credits
+#
+# ChatGPT grants occasional "usage limit resets" that Codex never reports, so the
+# count and its expiry are whatever the user tells cxa.
+
+
+def read_meta(name: str) -> dict:
+    return read_json(os.path.join(STORE, name + ".meta.json"))
+
+
+def write_meta(name: str, **fields: Any) -> dict:
+    meta = read_meta(name)
+    meta.update(fields)
+    write_json(os.path.join(STORE, name + ".meta.json"), meta)
+    return meta
+
+
+def mark_reset(name: str) -> None:
+    """Record that the account was reset elsewhere: zero its cached windows,
+    keeping their shape, and count one reset off."""
+    snapshot = read_json(os.path.join(STORE, name + ".usage.json"))
+    fresh: "dict[str, Any]" = {"observed_at": int(time.time()), "reset_marked": True}
+    for key in ("primary", "secondary"):
+        window = snapshot.get(key)
+        if window:
+            fresh[key] = {
+                "used_percent": 0.0,
+                "window_minutes": window.get("window_minutes"),
+                "resets_at": None,
+            }
+    write_json(os.path.join(STORE, name + ".usage.json"), fresh)
+
+    left = read_meta(name).get("resets_left")
+    if isinstance(left, int) and left > 0:
+        left -= 1
+        write_meta(name, resets_left=left)
+    tail = f", {left} reset(s) left" if isinstance(left, int) else ""
+    print(f"{GREEN}reset{OFF} {name}  {DIM}usage cleared{tail}{OFF}")
+
+
+# --------------------------------------------------------------------- rendering
+
+
+def format_countdown(resets_at: "int | None") -> str:
+    if not resets_at:
+        return ""
+    left = int(resets_at - time.time())
+    if left < 60:
+        return "now"
+    days, rest = divmod(left, 86400)
+    hours, minutes = divmod(rest // 60, 60)
+    if days:
+        return f"{days}d {hours}h"
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+
+def window_label(minutes: "int | None") -> str:
+    if not minutes:
+        return ""
+    if minutes >= 10080:
+        return "wk"
+    if minutes >= 1440:
+        return f"{minutes // 1440}d"
+    return f"{minutes // 60}h" if minutes >= 60 else f"{minutes}m"
+
+
+def percent_color(percent: float) -> str:
+    return GREEN if percent < 50 else (YELLOW if percent < 90 else RED)
+
+
+def usage_summary(name: str) -> str:
+    """One-line usage for the picker, e.g. `5h 12% · wk 41% resets 3h 9m`."""
+    limits = limits_for(name)
+    parts = [
+        f"{DIM}{window_label(w.minutes)}{OFF} {percent_color(w.percent)}{w.percent:.0f}%{OFF}"
+        for w in limits.windows
+        if w.known
+    ]
+    if not parts:
+        return f"{DIM}no data yet{OFF}"
+    line = f" {DIM}·{OFF} ".join(parts)
+    countdown = format_countdown(limits.next_reset)
+    return f"{line} {DIM}resets {countdown}{OFF}" if countdown else line
+
+
+def reset_credits(name: str) -> str:
+    meta = read_meta(name)
+    left = meta.get("resets_left")
+    if not isinstance(left, int):
+        return "-"
+    expiry = meta.get("resets_expire")
+    return f"{left}·{expiry[5:].replace('-', '/')}" if left > 0 and expiry else str(left)
+
+
+def last_seen(observed_at: "int | None") -> str:
+    if not observed_at:
+        return "-"
+    ago = format_countdown(2 * time.time() - observed_at)
+    return "just now" if ago in ("", "now") else f"{ago} ago"
+
+
+# ------------------------------------------------------------------ terminal ui
+
+
+class raw_terminal:
+    """Hold raw mode for a whole picker session - re-entering it per keypress
+    lets the tty echo characters that then vanish from the query."""
+
+    def __enter__(self) -> "raw_terminal":
+        self.fd = sys.stdin.fileno()
+        self.saved = termios.tcgetattr(self.fd)
+        tty.setraw(self.fd)
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+
+def read_key() -> str:
+    fd = sys.stdin.fileno()
+    char = os.read(fd, 1).decode(errors="ignore")
+    if char != "\033":
+        return char
+    # A bare Esc sends no follow-up bytes, so never block waiting for them.
+    sequence = ""
+    while len(sequence) < 2 and select.select([fd], [], [], 0.05)[0]:
+        sequence += os.read(fd, 1).decode(errors="ignore")
+    return {"[A": "up", "[B": "down"}.get(sequence, "esc")
+
+
+def fuzzy_match(query: str, label: str) -> bool:
+    """Subsequence match against the visible text only - labels carry colour codes."""
+    haystack = iter(ANSI.sub("", label).lower())
+    return all(char in haystack for char in query.lower())
+
+
+def choose(rows: "list[tuple[str, Any]]", header: str, footer: str) -> Any:
+    """Type-to-filter picker. Returns the chosen row's value, or None if cancelled."""
+    query, cursor, drawn = "", 0, 0
+    with raw_terminal():
+        while True:
+            matching = [row for row in rows if fuzzy_match(query, row[0])]
+            cursor = max(0, min(cursor, len(matching) - 1))
+
+            room = max(3, shutil.get_terminal_size((80, 24)).lines - 3)
+            top = 0
+            if len(matching) > room:
+                top = max(0, min(cursor - room // 2, len(matching) - room))
+            visible = matching[top : top + room]
+
+            frame = [f"\033[{drawn}A"] if drawn else []
+            frame.append(f"{header} {query}\033[K\r\n")
+            for offset, (label, _value) in enumerate(visible):
+                marker = f"{GREEN}>{OFF}" if top + offset == cursor else " "
+                frame.append(f"{marker} {label}\033[K\r\n")
+            frame.append(f"{DIM}{footer}{OFF}\033[K\r\n\033[J")
+            sys.stdout.write("".join(frame))
+            sys.stdout.flush()
+            drawn = len(visible) + 2
+
+            key = read_key()
+            if key in ("\x03", "esc"):
+                sys.stdout.write("\r\n")
+                return None
+            if key in ("\r", "\n"):
+                sys.stdout.write("\r\n")
+                return matching[cursor][1] if matching else None
+            if key == "up":
+                cursor -= 1
+            elif key == "down":
+                cursor += 1
+            elif key in ("\x7f", "\b"):
+                query = query[:-1]
+            elif key.isprintable():
+                query, cursor = query + key, 0
+
+
+def choose_account(header: str, annotate=None) -> "str | None":
+    rows = []
+    for account in list_accounts():
+        suffix = f"  {DIM}{annotate(account)}{OFF}" if annotate else ""
+        rows.append((f"  {account.name:<14}{DIM}{account.email}{OFF}{suffix}", account.name))
+    return choose(rows, f"{BOLD}{header}{OFF}", "esc to cancel")
+
+
+# ------------------------------------------------------------------- commands
+
+
+def cmd_status(*_: str) -> None:
+    """usage and reset time per account"""
+    refresh_usage()
+    accounts = list_accounts()
+    if not accounts:
+        print("no saved accounts yet - run `cxa login`")
+        return
+    current, favourite = active_id(), best_first(accounts)[0].name
+
+    print(f"  {'account':<14}{'email':<30}{'5h':<8}{'weekly':<8}"
+          f"{'next reset':<11}{'resets':<9}{'role':<9}seen")
+    for account in accounts:
+        limits = limits_for(account.name)
+        cells = [f"{w.percent:.0f}%" if w.known else "-" for w in limits.windows]
+        if account.account_id and account.account_id == current:
+            marker = f"{GREEN}*{OFF}"
+        elif account.name == favourite:
+            marker = f"{YELLOW}~{OFF}"
+        else:
+            marker = " "
+        print(f"{marker} {account.name:<14}{account.email:<30}{cells[0]:<8}{cells[1]:<8}"
+              f"{format_countdown(limits.next_reset) or '-':<11}"
+              f"{reset_credits(account.name):<9}{TIER_LABELS[tier(account.name)]:<9}"
+              f"{DIM}{last_seen(limits.observed_at)}{OFF}")
+    print(f"{DIM}  * active   ~ next up   |  5h accounts are spent first; a weekly-only "
+          f"account is held in reserve.\n"
+          f"  resets = credits you recorded yourself; Codex does not report them.{OFF}")
+
+
+def cmd_auto(*_: str) -> None:
+    """switch to the account with the most headroom"""
+    refresh_usage()
+    accounts = list_accounts()
+    if not accounts:
+        die("no saved accounts")
+    choice = best_first(accounts)[0]
+    if choice.account_id == active_id():
+        print(f"{GREEN}={OFF} {choice.name} already has the most headroom  "
+              f"{usage_summary(choice.name)}")
+        return
+    activate(choice.name)
+    print(f"  {usage_summary(choice.name)}")
+
+
+def cmd_menu() -> None:
+    """Interactive entry point: everything cxa can do, without memorising a verb."""
+    if not sys.stdin.isatty():
+        cmd_status()
+        return
+
+    sync_active()
+    refresh_usage()
+    current, accounts = active_id(), list_accounts()
+
+    rows = []
+    for account in accounts:
+        marker = f"{GREEN}*{OFF}" if account.account_id == current else " "
+        rows.append((
+            f"{marker} {account.name:<14}{DIM}{account.email:<30}{account.plan:<6}{OFF}"
+            f"{usage_summary(account.name)}",
+            ("use", account.name),
+        ))
+    if len(accounts) > 1:
+        rows.append((f"{YELLOW}~{OFF} rotate to the account with the most headroom", ("auto", None)))
+    if accounts:
+        rows.append((f"{YELLOW}o{OFF} mark an account as reset  "
+                     f"{DIM}(you used its reset elsewhere){OFF}", ("reset", None)))
+    if current and not any(a.account_id == current for a in accounts):
+        rows.append((f"{YELLOW}+{OFF} save current login  "
+                     f"{DIM}{read_identity(AUTH)[0]}{OFF}", ("save", None)))
+    rows.append((f"{YELLOW}+{OFF} log in to a new account", ("login", None)))
+    if accounts:
+        rows.append((f"{DIM}x  delete an account{OFF}", ("forget", None)))
+
+    action = choose(rows, f"{BOLD}codex account{OFF}", "type to search, up/down, enter, esc")
+    if not action:
+        return
+    kind, argument = action
+
+    if kind == "use":
+        activate(argument)
+    elif kind == "auto":
+        cmd_auto()
+    elif kind == "save":
+        save_active()
+    elif kind == "login":
+        login()
+    elif kind == "reset":
+        def credits(account: Account) -> str:
+            left = read_meta(account.name).get("resets_left")
+            return f"{left} left" if isinstance(left, int) else ""
+        name = choose_account("which account did you reset?", credits)
+        if name:
+            mark_reset(name)
+    elif kind == "forget":
+        name = choose_account("delete which?")
+        if name:
+            forget(name)
+
+
+def cmd_save(name: str = "", *_: str) -> None:
+    """save the current login under a name"""
+    save_active(name or None)
+
+
+def cmd_login(name: str = "", *_: str) -> None:
+    """log in to another account and save it"""
+    login(name or None)
+
+
+def cmd_forget(name: str = "", *_: str) -> None:
+    """delete a saved account"""
+    forget(name) if name else die("usage: cxa rm <name>")
+
+
+def cmd_reset(name: str = "", *_: str) -> None:
+    """you used that account's reset - clear its cached usage"""
+    mark_reset(name) if name else die("usage: cxa reset <name>")
+
+
+def cmd_resets(name: str = "", count: str = "", expiry: str = "", *_: str) -> None:
+    """record how many resets an account has left, and when they expire"""
+    if not name or not count:
+        die("usage: cxa resets <name> <count> [YYYY-MM-DD]")
+    find_account(name)
+    try:
+        fields = {"resets_left": int(count)}
+    except ValueError:
+        die(f"'{count}' is not a number")
+    if expiry:
+        fields["resets_expire"] = expiry
+    write_meta(name, **fields)
+    print(f"{name}: {count} reset(s) left" + (f", expires {expiry}" if expiry else ""))
+
+
+def cmd_list(*_: str) -> None:
+    """plain list, one account per line"""
+    current = active_id()
+    for account in list_accounts():
+        marker = "*" if account.account_id == current else " "
+        print(f"{marker} {account.name:<14}{account.email:<34}{account.plan}")
+
+
+# ------------------------------------------------------------------------- cli
+
+COMMANDS = {
+    "save": cmd_save,
+    "login": cmd_login,
+    "rm": cmd_forget,
+    "delete": cmd_forget,
+    "reset": cmd_reset,
+    "resets": cmd_resets,
+    "status": cmd_status,
+    "st": cmd_status,
+    "auto": cmd_auto,
+    "next": cmd_auto,
+    "list": cmd_list,
+    "ls": cmd_list,
+}
+
+USAGE = """cxa - switch between Codex CLI logins
+
+  cxa                                     menu: search, pick, switch, log in
+  cxa <name>                              switch straight to a saved account
+  cxa save [name]                         save the current login
+  cxa login [name]                        log in to another account and save it
+  cxa status                              usage and reset time per account
+  cxa auto                                switch to the account with most headroom
+  cxa reset <name>                        you used that account's reset elsewhere
+  cxa resets <name> <count> [YYYY-MM-DD]  record reset credits and their expiry
+  cxa rm <name>                           delete a saved account
+
+Environment:
+  CXA_FULL     percent at which a window counts as spent (default 100)
+  CXA_YES      skip the "codex is running" confirmation
+  CODEX_HOME   Codex config directory (default ~/.codex)
+
+Profiles live in ~/.codex/accounts and hold live OAuth tokens.
+Keep that directory out of git, Dropbox, and iCloud."""
+
+
+def main(argv: "list[str]") -> None:
+    if not argv:
+        return cmd_menu()
+    command, *rest = argv
+    if command in ("-h", "--help", "help"):
+        return print(USAGE)
+    if command in COMMANDS:
+        return COMMANDS[command](*rest)
+    activate(command)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        sys.exit(130)
