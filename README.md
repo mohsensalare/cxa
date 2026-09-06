@@ -31,7 +31,7 @@ type to search, up/down, enter, esc
 One file, no dependencies, Python 3.8+, macOS or Linux.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/USER/cxa/main/cxa -o ~/.local/bin/cxa
+curl -fsSL https://raw.githubusercontent.com/mohsensalare/cxa/main/cxa -o ~/.local/bin/cxa
 chmod +x ~/.local/bin/cxa
 ```
 
