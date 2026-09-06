@@ -47,6 +47,7 @@ nothing to memorise. The verbs are there for when you are in a hurry.
 | `cxa save [name]` | save the current login (name defaults to the email prefix) |
 | `cxa login [name]` | log in to another account and save it |
 | `cxa status` | usage and reset time per account |
+| `cxa sync [name]` | refresh usage from ChatGPT — all accounts, or one |
 | `cxa auto` | switch to the account with the most headroom |
 | `cxa reset <name>` | you used that account's reset — clear its cached usage |
 | `cxa resets <name> <count> [YYYY-MM-DD]` | record reset credits and their expiry |
@@ -55,6 +56,8 @@ nothing to memorise. The verbs are there for when you are in a hurry.
 Adding a second account: run `cxa`, pick **log in to a new account**. Your current login is
 snapshotted first, so it survives. Open the login link in a private window — otherwise the
 browser signs you straight back into the account you are already using.
+
+In the menu, **Tab** refreshes whatever line you are sitting on without leaving it.
 
 ## How the usage numbers work
 
@@ -73,8 +76,27 @@ reads. Two details make this harder than it looks:
 - **`primary` is not always the short window.** On one account `primary` is the 5-hour window;
   on another it is the weekly one. `cxa` sorts windows by `window_minutes`, never by key name.
 
-Nothing leaves your machine. There are no network calls and no API keys — `cxa` only ever
-reads and copies local files.
+This part is entirely offline — it only reads and copies local files.
+
+### Why `cxa sync` exists
+
+Local logs have two blind spots. An account you have not used lately shows numbers from
+whenever you last used it, and sessions run from the ChatGPT desktop app leave no local log at
+all, so the figures quietly freeze.
+
+`cxa sync` closes both by asking ChatGPT directly, using the access token already in that
+account's snapshot:
+
+```
+GET https://chatgpt.com/backend-api/wham/usage
+GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits
+```
+
+These are the only network calls `cxa` makes, they are read-only, and they only ever run when
+you ask — `cxa sync`, or Tab in the menu. Everything else still works with the network off.
+
+Both endpoints are undocumented and may change or disappear without notice. When a call fails,
+`cxa` says so on that account's line and falls back to the local logs.
 
 ## How rotation picks an account
 
@@ -93,8 +115,11 @@ almost-empty account instead of squeezing the last few requests out of it.
 
 ## Reset credits
 
-ChatGPT sometimes grants a "usage limit reset" under Settings. Codex never reports these, so
-they are yours to record:
+ChatGPT sometimes grants a "usage limit reset" under Settings. `cxa sync` reads how many are
+left and when they expire, and shows them in the `resets` column as `1·10/05`.
+
+You can also keep them by hand, which is what you want when you would rather not make network
+calls at all:
 
 ```bash
 cxa resets spare 1 2026-10-05    # one reset, expires Oct 5
@@ -108,8 +133,10 @@ keep ranking on numbers from before the reset.
 
 - A running Codex session keeps the token it already loaded. `cxa` warns when it finds a CLI
   session and notes when the desktop app is up; restart them after switching.
-- Usage figures come from the last time you actually used each account. An account you have not
-  touched in days shows old numbers — though a window past its reset time is counted as empty.
+- Without `cxa sync`, usage figures come from the last time you actually used each account —
+  and sessions run from the ChatGPT desktop app never write local logs at all.
+- `cxa sync` needs each account's stored access token to still be valid. If it has expired,
+  switch to that account once so Codex refreshes it.
 - Switching outside `cxa` (a manual `codex login`, say) breaks the journal's attribution until
   the next switch through `cxa`.
 

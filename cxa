@@ -28,6 +28,8 @@ import sys
 import termios
 import time
 import tty
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterable, NamedTuple
 
@@ -46,6 +48,11 @@ FULL = float(os.environ.get("CXA_FULL", 100))
 
 #: Windows no longer than this are the short, fast-refilling kind (Codex uses 5h).
 SHORT_WINDOW_MINUTES = 1440
+
+#: ChatGPT's own usage endpoints. Undocumented, so every read is best-effort.
+USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+NETWORK_TIMEOUT = 20
 
 #: Session logs run to tens of megabytes, so only their tail is ever read.
 TAIL_BYTES = 400_000
@@ -391,6 +398,96 @@ def limits_for(name: str) -> Limits:
     return Limits(slots["short"], slots["long"], snapshot.get("observed_at"))
 
 
+# ------------------------------------------------------------------ live sync
+#
+# Everything above works offline from Codex's own logs. These two calls are the
+# only ones that touch the network: they ask ChatGPT for an account's current
+# windows, which is the only way to see an account you have not used lately -
+# and the only place reset credits are published at all.
+
+
+def api_get(url: str, account: Account) -> Any:
+    """GET one of ChatGPT's usage endpoints as that account. Raises on failure."""
+    token = (read_json(account.path).get("tokens") or {}).get("access_token")
+    if not token:
+        raise RuntimeError("no access token stored")
+    request = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "OpenAI-Beta": "codex-1",
+        "originator": "codex_cli_rs",
+        "ChatGPT-Account-ID": account.account_id,
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=NETWORK_TIMEOUT) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            raise RuntimeError("token expired - switch to this account once to refresh it")
+        raise RuntimeError(f"HTTP {error.code}")
+    except (urllib.error.URLError, ValueError, TimeoutError) as error:
+        raise RuntimeError(str(getattr(error, "reason", error))[:60])
+
+
+def as_snapshot(window: Any) -> "dict | None":
+    """One API window in the same shape Codex writes into its session logs."""
+    if not isinstance(window, dict) or window.get("used_percent") is None:
+        return None
+    seconds = window.get("limit_window_seconds") or 0
+    return {
+        "used_percent": float(window["used_percent"]),
+        "window_minutes": int(seconds // 60) or None,
+        "resets_at": window.get("reset_at") or None,
+    }
+
+
+def local_date(stamp: Any) -> "str | None":
+    """ChatGPT dates arrive as UTC; show the day the user actually sees."""
+    if isinstance(stamp, (int, float)):
+        return time.strftime("%Y-%m-%d", time.localtime(stamp))
+    try:
+        text = str(stamp).replace("Z", "+0000").replace("+00:00", "+0000")
+        parsed = time.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")
+        return time.strftime("%Y-%m-%d", time.localtime(calendar.timegm(parsed)))
+    except (ValueError, TypeError):
+        return str(stamp)[:10] or None
+
+
+def sync_account(account: Account) -> str:
+    """Refresh one account from the API. Returns a short status line."""
+    try:
+        usage = api_get(USAGE_URL, account)
+    except RuntimeError as error:
+        return f"{RED}x{OFF} {account.name}: {error}"
+
+    limits = usage.get("rate_limit") or {}
+    snapshot: "dict[str, Any]" = {"observed_at": int(time.time()), "source": "api"}
+    for key, field in (("primary", "primary_window"), ("secondary", "secondary_window")):
+        window = as_snapshot(limits.get(field) or limits.get(key))
+        if window:
+            snapshot[key] = window
+    write_json(os.path.join(STORE, account.name + ".usage.json"), snapshot)
+
+    # Reset credits live behind their own endpoint; the usage payload only counts them.
+    try:
+        credits = api_get(CREDITS_URL, account)
+    except RuntimeError:
+        credits = usage.get("rate_limit_reset_credits") or {}
+    available = int(credits.get("available_count") or 0)
+    fields: "dict[str, Any]" = {"resets_left": available}
+    expiries = sorted(
+        c["expires_at"] for c in (credits.get("credits") or [])
+        if isinstance(c, dict) and c.get("expires_at") and c.get("status") != "used"
+    )
+    if expiries:
+        fields["resets_expire"] = local_date(expiries[0])
+    elif not available:
+        fields["resets_expire"] = None
+    write_meta(account.name, **fields)
+
+    return f"{GREEN}+{OFF} {account.name}: {usage_summary(account.name)}"
+
+
 # -------------------------------------------------------------------- rotation
 
 READY, UNUSED, RESERVE, SPENT = range(4)
@@ -554,9 +651,13 @@ def fuzzy_match(query: str, label: str) -> bool:
     return all(char in haystack for char in query.lower())
 
 
-def choose(rows: "list[tuple[str, Any]]", header: str, footer: str) -> Any:
-    """Type-to-filter picker. Returns the chosen row's value, or None if cancelled."""
+def choose(rows: "list[tuple[str, Any]]", header: str, footer: str, on_tab=None) -> Any:
+    """Type-to-filter picker. Returns the chosen row's value, or None if cancelled.
+
+    `on_tab(value)` runs against the highlighted row when Tab is pressed and
+    returns a fresh row list, letting the menu refresh a line without leaving."""
     query, cursor, drawn = "", 0, 0
+    status = ""
     with raw_terminal():
         while True:
             matching = [row for row in rows if fuzzy_match(query, row[0])]
@@ -573,12 +674,19 @@ def choose(rows: "list[tuple[str, Any]]", header: str, footer: str) -> Any:
             for offset, (label, _value) in enumerate(visible):
                 marker = f"{GREEN}>{OFF}" if top + offset == cursor else " "
                 frame.append(f"{marker} {label}\033[K\r\n")
-            frame.append(f"{DIM}{footer}{OFF}\033[K\r\n\033[J")
+            frame.append(f"{DIM}{status or footer}{OFF}\033[K\r\n\033[J")
             sys.stdout.write("".join(frame))
             sys.stdout.flush()
             drawn = len(visible) + 2
 
             key = read_key()
+            if key == "\t" and on_tab and matching:
+                status = "refreshing..."
+                sys.stdout.write(f"\033[1A{DIM}{status}{OFF}\033[K\r\n\033[J")
+                sys.stdout.flush()
+                rows, status = on_tab(matching[cursor][1])
+                continue
+            status = ""
             if key in ("\x03", "esc"):
                 sys.stdout.write("\r\n")
                 return None
@@ -632,7 +740,7 @@ def cmd_status(*_: str) -> None:
               f"{DIM}{last_seen(limits.observed_at)}{OFF}")
     print(f"{DIM}  * active   ~ next up   |  5h accounts are spent first; a weekly-only "
           f"account is held in reserve.\n"
-          f"  resets = credits you recorded yourself; Codex does not report them.{OFF}")
+          f"  `cxa sync` refreshes these from ChatGPT; tab does one line in the menu.{OFF}")
 
 
 def cmd_auto(*_: str) -> None:
@@ -658,29 +766,46 @@ def cmd_menu() -> None:
 
     sync_active()
     refresh_usage()
-    current, accounts = active_id(), list_accounts()
 
-    rows = []
-    for account in accounts:
-        marker = f"{GREEN}*{OFF}" if account.account_id == current else " "
-        rows.append((
-            f"{marker} {account.name:<14}{DIM}{account.email:<30}{account.plan:<6}{OFF}"
-            f"{usage_summary(account.name)}",
-            ("use", account.name),
-        ))
-    if len(accounts) > 1:
-        rows.append((f"{YELLOW}~{OFF} rotate to the account with the most headroom", ("auto", None)))
-    if accounts:
-        rows.append((f"{YELLOW}o{OFF} mark an account as reset  "
-                     f"{DIM}(you used its reset elsewhere){OFF}", ("reset", None)))
-    if current and not any(a.account_id == current for a in accounts):
-        rows.append((f"{YELLOW}+{OFF} save current login  "
-                     f"{DIM}{read_identity(AUTH)[0]}{OFF}", ("save", None)))
-    rows.append((f"{YELLOW}+{OFF} log in to a new account", ("login", None)))
-    if accounts:
-        rows.append((f"{DIM}x  delete an account{OFF}", ("forget", None)))
+    def build() -> "list[tuple[str, Any]]":
+        current, accounts = active_id(), list_accounts()
+        rows = []
+        for account in accounts:
+            marker = f"{GREEN}*{OFF}" if account.account_id == current else " "
+            rows.append((
+                f"{marker} {account.name:<14}{DIM}{account.email:<30}{account.plan:<6}{OFF}"
+                f"{usage_summary(account.name)}",
+                ("use", account.name),
+            ))
+        if len(accounts) > 1:
+            rows.append((f"{YELLOW}~{OFF} rotate to the account with the most headroom",
+                         ("auto", None)))
+        if accounts:
+            rows.append((f"{YELLOW}s{OFF} refresh every account from ChatGPT", ("sync", None)))
+            rows.append((f"{YELLOW}o{OFF} mark an account as reset  "
+                         f"{DIM}(you used its reset elsewhere){OFF}", ("reset", None)))
+        if current and not any(a.account_id == current for a in accounts):
+            rows.append((f"{YELLOW}+{OFF} save current login  "
+                         f"{DIM}{read_identity(AUTH)[0]}{OFF}", ("save", None)))
+        rows.append((f"{YELLOW}+{OFF} log in to a new account", ("login", None)))
+        if accounts:
+            rows.append((f"{DIM}x  delete an account{OFF}", ("forget", None)))
+        return rows
 
-    action = choose(rows, f"{BOLD}codex account{OFF}", "type to search, up/down, enter, esc")
+    def on_tab(value) -> "tuple[list, str]":
+        """Tab on an account line refreshes just that one, in place."""
+        kind, name = value
+        if kind == "sync":
+            for account in list_accounts():
+                sync_account(account)
+            return (build(), "refreshed every account")
+        if kind != "use":
+            return (build(), "tab refreshes an account line")
+        note = ANSI.sub("", sync_account(find_account(name)))
+        return (build(), note if note.startswith("x") else f"refreshed {name}")
+
+    action = choose(build(), f"{BOLD}codex account{OFF}",
+                    "type to search, up/down, tab to refresh, enter, esc", on_tab)
     if not action:
         return
     kind, argument = action
@@ -689,6 +814,8 @@ def cmd_menu() -> None:
         activate(argument)
     elif kind == "auto":
         cmd_auto()
+    elif kind == "sync":
+        cmd_sync()
     elif kind == "save":
         save_active()
     elif kind == "login":
@@ -741,6 +868,15 @@ def cmd_resets(name: str = "", count: str = "", expiry: str = "", *_: str) -> No
     print(f"{name}: {count} reset(s) left" + (f", expires {expiry}" if expiry else ""))
 
 
+def cmd_sync(name: str = "", *_: str) -> None:
+    """refresh usage from ChatGPT (one account, or all of them)"""
+    targets = [find_account(name)] if name else list_accounts()
+    if not targets:
+        die("no saved accounts")
+    for account in targets:
+        print(sync_account(account))
+
+
 def cmd_list(*_: str) -> None:
     """plain list, one account per line"""
     current = active_id()
@@ -758,6 +894,8 @@ COMMANDS = {
     "delete": cmd_forget,
     "reset": cmd_reset,
     "resets": cmd_resets,
+    "sync": cmd_sync,
+    "refresh": cmd_sync,
     "status": cmd_status,
     "st": cmd_status,
     "auto": cmd_auto,
@@ -773,6 +911,7 @@ USAGE = """cxa - switch between Codex CLI logins
   cxa save [name]                         save the current login
   cxa login [name]                        log in to another account and save it
   cxa status                              usage and reset time per account
+  cxa sync [name]                         refresh usage from ChatGPT (all, or one)
   cxa auto                                switch to the account with most headroom
   cxa reset <name>                        you used that account's reset elsewhere
   cxa resets <name> <count> [YYYY-MM-DD]  record reset credits and their expiry
