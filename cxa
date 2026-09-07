@@ -618,6 +618,7 @@ def pad(text: str, width: int, right: bool = False) -> str:
 
 #: `left` and `resets` for one window, then the same for the other.
 GROUP = 4 + 2 + 7
+CREDITS = 10
 
 
 def usage_cells(name: str) -> "tuple[str, str]":
@@ -634,15 +635,31 @@ def usage_cells(name: str) -> "tuple[str, str]":
 #: The two header lines over the usage columns; callers supply the left-hand
 #: labels, which is why these carry no indent of their own.
 USAGE_HEADINGS = (
-    f"{pad('5h', GROUP)}  {pad('weekly', GROUP)}",
+    f"{pad('5h', GROUP)}  {pad('weekly', GROUP)}  {pad('', CREDITS)}",
     f"{pad('left', 4, right=True)}  {pad('resets', 7)}  "
-    f"{pad('left', 4, right=True)}  {pad('resets', 7)}",
+    f"{pad('left', 4, right=True)}  {pad('resets', 7)}  {pad('credits', CREDITS)}",
 )
 
 
 def reset_credits(name: str) -> str:
-    left = read_meta(name).get("resets_left")
-    return f"{YELLOW}+{left} reset{OFF}" if isinstance(left, int) and left > 0 else ""
+    """Full resets ChatGPT has granted this account, with the first expiry."""
+    meta = read_meta(name)
+    left = meta.get("resets_left")
+    if not isinstance(left, int):
+        return pad(f"{DIM}?{OFF}", CREDITS)
+    if left < 1:
+        return pad(f"{DIM}-{OFF}", CREDITS)
+    expiry = meta.get("resets_expire")
+    day = f" {DIM}{format_day(expiry)}{OFF}" if expiry else ""
+    return pad(f"{YELLOW}{left}{OFF}{day}", CREDITS)
+
+
+def format_day(iso: str) -> str:
+    """`2026-09-21` as `Sep 21`, to read like the window resets beside it."""
+    try:
+        return time.strftime("%b %-d", time.strptime(iso, "%Y-%m-%d"))
+    except (ValueError, TypeError):
+        return str(iso)
 
 
 def last_seen(observed_at: "int | None") -> str:
@@ -780,8 +797,8 @@ def cmd_status(*_: str) -> None:
         seen = last_seen(limits_for(account.name).observed_at)
         print(f"{mark} {pad(account.name, names)}  {DIM}{pad(account.email, mails)}  "
               f"{pad(account.plan, plans)}{OFF}  {short}  {long}  "
-              f"{pad(TIER_LABELS[tier(account.name)], 8)}{DIM}{seen}{OFF}  "
-              f"{reset_credits(account.name)}".rstrip())
+              f"{reset_credits(account.name)}  "
+              f"{pad(TIER_LABELS[tier(account.name)], 8)}{DIM}{seen}{OFF}".rstrip())
     print(f"{DIM}  * active   ~ next up   |   percentages are what is LEFT, not what "
           f"you used\n"
           f"  a 5h window is spent before a weekly-only account, which is held in reserve\n"

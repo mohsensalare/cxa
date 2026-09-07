@@ -9,9 +9,9 @@ and never needs `codex logout`.
 ```
 $ cxa status
                                                 5h             weekly
-  account       email                     plan  left  resets   left  resets   role      seen
-~ work          you@example.com           plus    2%  3h 30m    59%  Sep 13             1h ago
-* spare         other@example.com         plus     -             43%  Sep 15   reserve  11m ago
+  account       email                     plan  left  resets   left  resets   credits     role     seen
+~ work          you@example.com           plus    2%  3h 30m    59%  Sep 13   3 Sep 21             1h ago
+* spare         other@example.com         plus     -             43%  Sep 15   -           reserve  11m ago
   * active   ~ next up   |   percentages are what is LEFT, not what you used
 ```
 
@@ -19,9 +19,9 @@ $ cxa status
 $ cxa
 codex accounts
                                           5h             weekly
-                                          left  resets   left  resets
-> * work    you@example.com     plus        2%  3h 30m    59%  Sep 13
-    spare   other@example.com   plus         -             43%  Sep 15
+                                          left  resets   left  resets   credits
+> * work    you@example.com     plus        2%  3h 30m    59%  Sep 13   3 Sep 21
+    spare   other@example.com   plus         -             43%  Sep 15   -
   ~ rotate to the account with the most headroom
   s refresh every account from ChatGPT
   o mark an account as reset
@@ -69,10 +69,9 @@ close and a date once it is not:
 
 ```
                                                 5h             weekly
-  account       email                     plan  left  resets   left  resets   role    seen
-  kotook.ae     kotook.ae@gmail.com       team    0%  3h 18m    58%  Sep 13   spent   10m ago
-* main          kamusumawola26@gmail.com  plus   32%  2h 55m     0%  Sep 12   spent   4m ago
-~ peykan.yavuz  peykan.yavuz@aloovpn.com  plus     -             0%  Sep 14   spent   4m ago
+  account       email                     plan  left  resets   left  resets   credits     role    seen
+  work          you@example.com           team    0%  3h 18m    58%  Sep 13   3 Sep 21    spent   10m ago
+* spare         other@example.com         plus   32%  2h 55m     0%  Sep 12   -           spent   4m ago
 ```
 
 ## How the usage numbers work
@@ -134,8 +133,9 @@ almost-empty account instead of squeezing the last few requests out of it.
 
 ## Reset credits
 
-ChatGPT sometimes grants a "usage limit reset" under Settings. `cxa sync` reads how many are
-left and when they expire, and shows them in the `resets` column as `1·10/05`.
+ChatGPT sometimes grants a "usage limit reset" under Settings - one credit clears both the 5h
+and the weekly window. `cxa sync` reads how many are left and when the first one expires, and
+shows them in the `credits` column as `3 Sep 21`.
 
 You can also keep them by hand, which is what you want when you would rather not make network
 calls at all:
