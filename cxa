@@ -600,13 +600,23 @@ def usage_summary(name: str) -> str:
     return f"{line} {DIM}resets {countdown}{OFF}" if countdown else line
 
 
-def reset_credits(name: str) -> str:
-    meta = read_meta(name)
-    left = meta.get("resets_left")
-    if not isinstance(left, int):
-        return "-"
-    expiry = meta.get("resets_expire")
-    return f"{left}·{expiry[5:].replace('-', '/')}" if left > 0 and expiry else str(left)
+def pad(text: str, width: int, right: bool = False) -> str:
+    """Pad to a visible width, ignoring the colour codes inside `text`."""
+    space = " " * max(0, width - len(ANSI.sub("", text)))
+    return space + text if right else text + space
+
+
+def usage_cells(name: str) -> "tuple[str, str, str, str]":
+    """The four aligned columns behind an account: 5h, weekly, reset, credits."""
+    limits = limits_for(name)
+    short, long = (
+        f"{percent_color(w.percent)}{w.percent:.0f}%{OFF}" if w.known else f"{DIM}-{OFF}"
+        for w in limits.windows
+    )
+    countdown = format_countdown(limits.next_reset)
+    left = read_meta(name).get("resets_left")
+    credits = f"{YELLOW}+{left} reset{OFF}" if isinstance(left, int) and left > 0 else ""
+    return short, long, f"{DIM}{countdown}{OFF}" if countdown else "", credits
 
 
 def last_seen(observed_at: "int | None") -> str:
@@ -661,7 +671,11 @@ def choose(rows: "list[tuple[str, Any]]", header: str, footer: str, on_tab=None)
     with raw_terminal():
         while True:
             matching = [row for row in rows if fuzzy_match(query, row[0])]
-            cursor = max(0, min(cursor, len(matching) - 1))
+            if query:  # headings and blank lines only make sense in the full list
+                matching = [row for row in matching if row[1] is not None]
+            pickable = [i for i, row in enumerate(matching) if row[1] is not None]
+            if pickable:
+                cursor = min(pickable, key=lambda i: (abs(i - cursor), i))
 
             room = max(3, shutil.get_terminal_size((80, 24)).lines - 3)
             top = 0
@@ -672,7 +686,7 @@ def choose(rows: "list[tuple[str, Any]]", header: str, footer: str, on_tab=None)
             frame = [f"\033[{drawn}A"] if drawn else []
             frame.append(f"{header} {query}\033[K\r\n")
             for offset, (label, _value) in enumerate(visible):
-                marker = f"{GREEN}>{OFF}" if top + offset == cursor else " "
+                marker = f"{GREEN}{BOLD}>{OFF}" if top + offset == cursor else " "
                 frame.append(f"{marker} {label}\033[K\r\n")
             frame.append(f"{DIM}{status or footer}{OFF}\033[K\r\n\033[J")
             sys.stdout.write("".join(frame))
@@ -680,7 +694,7 @@ def choose(rows: "list[tuple[str, Any]]", header: str, footer: str, on_tab=None)
             drawn = len(visible) + 2
 
             key = read_key()
-            if key == "\t" and on_tab and matching:
+            if key == "\t" and on_tab and pickable:
                 status = "refreshing..."
                 sys.stdout.write(f"\033[1A{DIM}{status}{OFF}\033[K\r\n\033[J")
                 sys.stdout.flush()
@@ -692,11 +706,11 @@ def choose(rows: "list[tuple[str, Any]]", header: str, footer: str, on_tab=None)
                 return None
             if key in ("\r", "\n"):
                 sys.stdout.write("\r\n")
-                return matching[cursor][1] if matching else None
+                return matching[cursor][1] if pickable else None
             if key == "up":
-                cursor -= 1
+                cursor = next((i for i in reversed(pickable) if i < cursor), cursor)
             elif key == "down":
-                cursor += 1
+                cursor = next((i for i in pickable if i > cursor), cursor)
             elif key in ("\x7f", "\b"):
                 query = query[:-1]
             elif key.isprintable():
@@ -722,22 +736,26 @@ def cmd_status(*_: str) -> None:
         print("no saved accounts yet - run `cxa login`")
         return
     current, favourite = active_id(), best_first(accounts)[0].name
+    names = max([len(a.name) for a in accounts] + [7])
+    mails = max([len(a.email) for a in accounts] + [5])
+    plans = max([len(a.plan) for a in accounts] + [4])
 
-    print(f"  {'account':<14}{'email':<30}{'5h':<8}{'weekly':<8}"
-          f"{'next reset':<11}{'resets':<9}{'role':<9}seen")
+    print(f"{DIM}  {pad('account', names)}  {pad('email', mails)}  {pad('plan', plans)}  "
+          f"{pad('5h', 4, right=True)}  {pad('week', 4, right=True)}  {pad('reset', 7)}  "
+          f"{pad('role', 8)}seen{OFF}")
     for account in accounts:
-        limits = limits_for(account.name)
-        cells = [f"{w.percent:.0f}%" if w.known else "-" for w in limits.windows]
+        short, long, countdown, credits = usage_cells(account.name)
         if account.account_id and account.account_id == current:
-            marker = f"{GREEN}*{OFF}"
+            mark = f"{GREEN}*{OFF}"
         elif account.name == favourite:
-            marker = f"{YELLOW}~{OFF}"
+            mark = f"{YELLOW}~{OFF}"
         else:
-            marker = " "
-        print(f"{marker} {account.name:<14}{account.email:<30}{cells[0]:<8}{cells[1]:<8}"
-              f"{format_countdown(limits.next_reset) or '-':<11}"
-              f"{reset_credits(account.name):<9}{TIER_LABELS[tier(account.name)]:<9}"
-              f"{DIM}{last_seen(limits.observed_at)}{OFF}")
+            mark = " "
+        seen = last_seen(limits_for(account.name).observed_at)
+        print(f"{mark} {pad(account.name, names)}  {DIM}{pad(account.email, mails)}  "
+              f"{pad(account.plan, plans)}{OFF}  {pad(short, 4, right=True)}  "
+              f"{pad(long, 4, right=True)}  {pad(countdown or f'{DIM}-{OFF}', 7)}  "
+              f"{pad(TIER_LABELS[tier(account.name)], 8)}{DIM}{seen}{OFF}  {credits}".rstrip())
     print(f"{DIM}  * active   ~ next up   |  5h accounts are spent first; a weekly-only "
           f"account is held in reserve.\n"
           f"  `cxa sync` refreshes these from ChatGPT; tab does one line in the menu.{OFF}")
@@ -768,28 +786,41 @@ def cmd_menu() -> None:
     refresh_usage()
 
     def build() -> "list[tuple[str, Any]]":
+        """One table of accounts, then the actions - both on the same left edge."""
         current, accounts = active_id(), list_accounts()
-        rows = []
-        for account in accounts:
-            marker = f"{GREEN}*{OFF}" if account.account_id == current else " "
-            rows.append((
-                f"{marker} {account.name:<14}{DIM}{account.email:<30}{account.plan:<6}{OFF}"
-                f"{usage_summary(account.name)}",
-                ("use", account.name),
-            ))
+        names = max([len(a.name) for a in accounts] + [7])
+        mails = max([len(a.email) for a in accounts] + [5])
+        plans = max([len(a.plan) for a in accounts] + [4])
+
+        def account_row(account: Account) -> str:
+            short, long, countdown, credits = usage_cells(account.name)
+            live = account.account_id == current
+            mark, name = (f"{GREEN}*{OFF}", BOLD) if live else (" ", "")
+            return (f"{mark} {name}{pad(account.name, names)}{OFF if name else ''}  "
+                    f"{DIM}{pad(account.email, mails)}  {pad(account.plan, plans)}{OFF}  "
+                    f"{pad(short, 4, right=True)}  {pad(long, 4, right=True)}  "
+                    f"{pad(countdown, 7)}  {credits}".rstrip())
+
+        heading = (f"{DIM}  {pad('', names)}  {pad('', mails)}  {pad('', plans)}  "
+                   f"{pad('5h', 4, right=True)}  {pad('week', 4, right=True)}  reset{OFF}")
+
+        rows: "list[tuple[str, Any]]" = [(heading, None)] if accounts else []
+        rows += [(account_row(a), ("use", a.name)) for a in accounts]
+
+        actions = []
         if len(accounts) > 1:
-            rows.append((f"{YELLOW}~{OFF} rotate to the account with the most headroom",
-                         ("auto", None)))
+            actions.append(("~", "rotate to the account with the most headroom", "auto"))
         if accounts:
-            rows.append((f"{YELLOW}s{OFF} refresh every account from ChatGPT", ("sync", None)))
-            rows.append((f"{YELLOW}o{OFF} mark an account as reset  "
-                         f"{DIM}(you used its reset elsewhere){OFF}", ("reset", None)))
+            actions.append(("s", "refresh every account from ChatGPT", "sync"))
+            actions.append(("o", "mark an account as reset", "reset"))
         if current and not any(a.account_id == current for a in accounts):
-            rows.append((f"{YELLOW}+{OFF} save current login  "
-                         f"{DIM}{read_identity(AUTH)[0]}{OFF}", ("save", None)))
-        rows.append((f"{YELLOW}+{OFF} log in to a new account", ("login", None)))
+            actions.append(("+", f"save this login  {DIM}{read_identity(AUTH)[0]}{OFF}", "save"))
+        actions.append(("+", "log in to a new account", "login"))
         if accounts:
-            rows.append((f"{DIM}x  delete an account{OFF}", ("forget", None)))
+            actions.append(("x", "delete an account", "forget"))
+
+        rows.append(("", None))
+        rows += [(f"{YELLOW}{key}{OFF} {text}", (kind, None)) for key, text, kind in actions]
         return rows
 
     def on_tab(value) -> "tuple[list, str]":
@@ -804,8 +835,9 @@ def cmd_menu() -> None:
         note = ANSI.sub("", sync_account(find_account(name)))
         return (build(), note if note.startswith("x") else f"refreshed {name}")
 
-    action = choose(build(), f"{BOLD}codex account{OFF}",
-                    "type to search, up/down, tab to refresh, enter, esc", on_tab)
+    action = choose(build(), f"{BOLD}codex accounts{OFF}",
+                    "type to search  \u00b7  tab refreshes a line  \u00b7  "
+                    "enter switches  \u00b7  esc quits", on_tab)
     if not action:
         return
     kind, argument = action
