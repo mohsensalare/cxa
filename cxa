@@ -9,8 +9,12 @@ It also reads the rate-limit windows Codex records in its own session logs, so
 `cxa status` can show how much of each account is left and `cxa auto` can move
 you to the one with the most headroom.
 
-No dependencies, no network calls, and Codex's own configuration is never
-touched - cxa is invisible to it.
+`cxa sync` can also ask ChatGPT for the current figures, which is the only time
+cxa touches the network. It has no dependencies, and it never writes to Codex's
+own configuration - cxa is invisible to it.
+
+Runs on macOS, Linux and Windows; see the platform section below for the parts
+that differ.
 """
 
 from __future__ import annotations
@@ -50,6 +54,10 @@ NEWLINE = "\n" if WINDOWS else "\r\n"
 
 
 def term_width() -> int:
+    """A redirected stdout has no width worth respecting, so keep every column
+    there - piping `cxa status` into a file should not silently drop one."""
+    if not sys.stdout.isatty() and "COLUMNS" not in os.environ:
+        return 10_000
     return shutil.get_terminal_size((80, 24)).columns
 
 

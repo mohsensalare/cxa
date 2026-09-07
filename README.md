@@ -32,12 +32,55 @@ type to search  ·  tab refreshes a line  ·  enter switches  ·  esc quits
 
 ## Install
 
-One file, no dependencies, Python 3.8+, macOS or Linux.
+One file, no dependencies, Python 3.8 or newer. macOS, Linux and Windows.
+
+### macOS and Linux
 
 ```bash
+mkdir -p ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/mohsensalare/cxa/main/cxa -o ~/.local/bin/cxa
 chmod +x ~/.local/bin/cxa
 ```
+
+If `cxa` is not found afterwards, `~/.local/bin` is not on your `PATH`:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc
+```
+
+> On macOS, keep the file outside `~/Documents`, `~/Desktop` and `~/Downloads`. Those folders
+> are TCC-protected, and a Homebrew Python is refused permission to read a script inside them.
+
+### Windows
+
+Run in PowerShell. This installs to your user profile and needs no administrator rights.
+
+```powershell
+$dir = "$env:LOCALAPPDATA\Programs\cxa"
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Invoke-WebRequest -UseBasicParsing `
+  -Uri https://raw.githubusercontent.com/mohsensalare/cxa/main/cxa `
+  -OutFile "$dir\cxa.py"
+
+@'
+@echo off
+where py >nul 2>nul
+if %errorlevel%==0 (py -3 "%~dp0cxa.py" %*) else (python "%~dp0cxa.py" %*)
+'@ | Set-Content -Encoding ASCII "$dir\cxa.cmd"
+
+$path = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($path -notlike "*$dir*") {
+    [Environment]::SetEnvironmentVariable("Path", "$path;$dir", "User")
+}
+```
+
+Open a new terminal, then run `cxa`. Windows Terminal is worth using over the old console
+window: cxa switches on VT processing either way, but Windows Terminal renders colour properly
+and is not stuck at 80 columns.
+
+> If you run Codex inside WSL, install `cxa` **inside WSL** with the Linux instructions above.
+> Codex keeps its login in the filesystem it runs in, and a Windows-side `cxa` would be looking
+> at a different `.codex` directory.
 
 ## Use
 
@@ -158,13 +201,28 @@ keep ranking on numbers from before the reset.
   switch to that account once so Codex refreshes it.
 - Switching outside `cxa` (a manual `codex login`, say) breaks the journal's attribution until
   the next switch through `cxa`.
+- The table drops the email column when the terminal is too narrow for it, which an 80-column
+  Windows console is. Widen the window to get it back.
 
 ## Security
 
-`~/.codex/accounts` holds live OAuth tokens, one file per account, `chmod 600` inside a `700`
-directory. Anything that can read those files can act as you.
+`~/.codex/accounts` (`%USERPROFILE%\.codex\accounts` on Windows) holds live OAuth tokens, one
+file per account. Anything that can read those files can act as you.
 
-Keep that directory out of git, Dropbox, iCloud, and any dotfiles repo.
+On macOS and Linux they are written `chmod 600` inside a `700` directory. Windows has no
+equivalent worth calling from a script, so they inherit the profile's ACL — private to your
+user account, but readable by an administrator.
+
+Keep that directory out of git, Dropbox, OneDrive, iCloud, and any dotfiles repo.
+
+## Development
+
+`cxa` is one file with no dependencies, so there is nothing to build. The Windows branches can
+be checked from macOS or Linux, which is how they were written:
+
+```bash
+python3 test_windows.py
+```
 
 ## License
 
