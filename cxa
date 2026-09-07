@@ -21,17 +21,66 @@ import glob
 import json
 import os
 import re
-import select
 import shutil
 import subprocess
 import sys
-import termios
 import time
-import tty
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterable, NamedTuple
+
+# --------------------------------------------------------------------- platform
+
+WINDOWS = os.name == "nt"
+
+if WINDOWS:
+    import msvcrt
+else:
+    import select
+    import termios
+    import tty
+
+#: A day number without a leading zero - the flag for that differs per platform.
+DAY_FORMAT = "%b %#d" if WINDOWS else "%b %-d"
+
+#: In raw mode a bare newline does not return the cursor to column 0. Windows is
+#: never put in raw mode, and its text mode supplies the carriage return itself.
+NEWLINE = "\n" if WINDOWS else "\r\n"
+
+
+def term_width() -> int:
+    return shutil.get_terminal_size((80, 24)).columns
+
+
+def term_lines() -> int:
+    return shutil.get_terminal_size((80, 24)).lines
+
+
+def enable_ansi() -> bool:
+    """Windows consoles ignore escape codes until VT processing is switched on.
+    Windows Terminal does it for you; conhost, and older builds, do not."""
+    if not WINDOWS:
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except (OSError, AttributeError, ImportError):
+        return False
+
+
+def make_private(path: str) -> None:
+    """Owner-only permissions. Windows has no chmod worth calling, but the store
+    sits under the user profile, which is already locked to that user."""
+    if not WINDOWS:
+        os.chmod(path, 0o600)
+
 
 # --------------------------------------------------------------------- settings
 
@@ -61,7 +110,7 @@ MAX_LOGS_PER_SCAN = 120
 DIM, GREEN, YELLOW, RED, BOLD, OFF = (
     "\033[2m", "\033[32m", "\033[33m", "\033[31m", "\033[1m", "\033[0m",
 )
-if not sys.stdout.isatty():
+if not sys.stdout.isatty() or not enable_ansi():
     DIM = GREEN = YELLOW = RED = BOLD = OFF = ""
 
 ANSI = re.compile(r"\033\[[0-9;]*[A-Za-z]")
@@ -83,7 +132,7 @@ def write_json(path: str, payload: Any) -> None:
     os.makedirs(STORE, mode=0o700, exist_ok=True)
     with open(path, "w") as fh:
         json.dump(payload, fh)
-    os.chmod(path, 0o600)
+    make_private(path)
 
 
 # ---------------------------------------------------------------------- accounts
@@ -158,16 +207,39 @@ def sync_active() -> None:
             return
 
 
-def running_codex() -> "tuple[list[int], bool]":
-    """(cli pids, desktop app running). The ChatGPT app ships a dozen helper
-    processes with `codex` in their path, so only its bundle is counted, once."""
+def process_list(command: "list[str]") -> str:
     try:
-        listing = subprocess.run(["ps", "-Ao", "pid=,comm="], capture_output=True,
-                                 text=True, timeout=5).stdout
+        return subprocess.run(command, capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
-        return ([], False)
+        return ""
+
+
+def running_codex() -> "tuple[list[int], bool]":
+    """(cli pids, desktop app running)."""
+    return running_codex_windows() if WINDOWS else running_codex_posix()
+
+
+def running_codex_windows() -> "tuple[list[int], bool]":
+    """tasklist reports image names only, which is all this needs: the CLI is
+    codex.exe and the desktop app is ChatGPT.exe, helper processes included."""
     cli, app = [], False
-    for line in listing.splitlines():
+    for line in process_list(["tasklist", "/nh", "/fo", "csv"]).splitlines():
+        fields = [field.strip('" ') for field in line.split('","')]
+        if len(fields) < 2:
+            continue
+        name, pid = fields[0].lower(), fields[1].replace(",", "")
+        if name == "chatgpt.exe":
+            app = True
+        elif name == "codex.exe" and pid.isdigit():
+            cli.append(int(pid))
+    return (cli, app)
+
+
+def running_codex_posix() -> "tuple[list[int], bool]":
+    """The ChatGPT app ships a dozen helper processes with `codex` in their path,
+    so its bundle is recognised as one app rather than a pile of CLI sessions."""
+    cli, app = [], False
+    for line in process_list(["ps", "-Ao", "pid=,comm="]).splitlines():
         pid, _, command = line.strip().partition(" ")
         if ".app/" in command.lower() or "/Contents/" in command:
             app = app or bool(re.search(r"/(ChatGPT|Codex)\.app/", command))
@@ -211,7 +283,7 @@ def save_active(name: "str | None" = None) -> None:
     os.makedirs(STORE, mode=0o700, exist_ok=True)
     destination = os.path.join(STORE, name + ".json")
     shutil.copyfile(AUTH, destination)
-    os.chmod(destination, 0o600)
+    make_private(destination)
     record_switch(name)
     print(f"{GREEN}saved{OFF} {name}  {DIM}{email}{OFF}")
 
@@ -223,18 +295,21 @@ def activate(name: str) -> None:
         return
     sync_active()
     shutil.copyfile(account.path, AUTH)
-    os.chmod(AUTH, 0o600)
+    make_private(AUTH)
     record_switch(name)
     print(f"{GREEN}->{OFF} {name}  {DIM}{account.email}{OFF}")
 
 
 def login(name: "str | None" = None) -> None:
-    if not shutil.which("codex"):
+    codex = shutil.which("codex")
+    if not codex:
         die("codex CLI not found in PATH")
+    # A .cmd shim is a batch file, which only cmd.exe knows how to start.
+    launch = ["cmd", "/c", codex] if codex.lower().endswith((".cmd", ".bat")) else [codex]
     sync_active()
     if os.path.exists(AUTH):
         os.remove(AUTH)
-    subprocess.run(["codex", "login"])
+    subprocess.run(launch + ["login"])
     if os.path.exists(AUTH):
         save_active(name)
     else:
@@ -274,7 +349,7 @@ def record_switch(name: str) -> None:
         os.remove(JOURNAL + ".tmp")
         with open(JOURNAL, "w") as fh:
             fh.write(json.dumps({"t": 0, "name": name}) + "\n")
-        os.chmod(JOURNAL, 0o600)
+        make_private(JOURNAL)
         return
     if entries[-1]["name"] != name:
         with open(JOURNAL, "a") as fh:
@@ -596,7 +671,7 @@ def format_reset(resets_at: "int | None") -> str:
         return ""
     if resets_at - time.time() < 86400:
         return format_countdown(resets_at)
-    return time.strftime("%b %-d", time.localtime(resets_at))
+    return time.strftime(DAY_FORMAT, time.localtime(resets_at))
 
 
 def usage_summary(name: str) -> str:
@@ -632,6 +707,16 @@ def usage_cells(name: str) -> "tuple[str, str]":
     return cells[0], cells[1]
 
 
+def name_columns(accounts: "list[Account]", trailing: int = 0) -> "tuple[int, int, int]":
+    """Widths for name, email and plan. The email is the column worth losing when
+    the terminal is too narrow, and an 80-column console cannot hold it."""
+    names = max([len(a.name) for a in accounts] + [7])
+    mails = max([len(a.email) for a in accounts] + [5])
+    plans = max([len(a.plan) for a in accounts] + [4])
+    fixed = 2 + names + 2 + plans + 2 + GROUP + 2 + GROUP + 2 + CREDITS + trailing
+    return (names, mails if fixed + mails + 2 <= term_width() else 0, plans)
+
+
 #: The two header lines over the usage columns; callers supply the left-hand
 #: labels, which is why these carry no indent of their own.
 USAGE_HEADINGS = (
@@ -657,7 +742,7 @@ def reset_credits(name: str) -> str:
 def format_day(iso: str) -> str:
     """`2026-09-21` as `Sep 21`, to read like the window resets beside it."""
     try:
-        return time.strftime("%b %-d", time.strptime(iso, "%Y-%m-%d"))
+        return time.strftime(DAY_FORMAT, time.strptime(iso, "%Y-%m-%d"))
     except (ValueError, TypeError):
         return str(iso)
 
@@ -674,19 +759,31 @@ def last_seen(observed_at: "int | None") -> str:
 
 class raw_terminal:
     """Hold raw mode for a whole picker session - re-entering it per keypress
-    lets the tty echo characters that then vanish from the query."""
+    lets the tty echo characters that then vanish from the query. Windows reads
+    the console directly instead, so there is no mode to hold."""
 
     def __enter__(self) -> "raw_terminal":
-        self.fd = sys.stdin.fileno()
-        self.saved = termios.tcgetattr(self.fd)
-        tty.setraw(self.fd)
+        if not WINDOWS:
+            self.fd = sys.stdin.fileno()
+            self.saved = termios.tcgetattr(self.fd)
+            tty.setraw(self.fd)
         return self
 
     def __exit__(self, *_: Any) -> None:
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+        if not WINDOWS:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
 
 
 def read_key() -> str:
+    """One keystroke: the character typed, or a name for the keys cxa acts on."""
+    try:
+        return read_key_windows() if WINDOWS else read_key_posix()
+    except KeyboardInterrupt:
+        # Windows raises this instead of handing Ctrl-C over as a character.
+        return "\x03"
+
+
+def read_key_posix() -> str:
     fd = sys.stdin.fileno()
     char = os.read(fd, 1).decode(errors="ignore")
     if char != "\033":
@@ -696,6 +793,14 @@ def read_key() -> str:
     while len(sequence) < 2 and select.select([fd], [], [], 0.05)[0]:
         sequence += os.read(fd, 1).decode(errors="ignore")
     return {"[A": "up", "[B": "down"}.get(sequence, "esc")
+
+
+def read_key_windows() -> str:
+    char = msvcrt.getwch()
+    if char in ("\x00", "\xe0"):
+        # Arrows and function keys arrive as a lead byte plus a scan code.
+        return {"H": "up", "P": "down"}.get(msvcrt.getwch(), "")
+    return "esc" if char == "\x1b" else char
 
 
 def fuzzy_match(query: str, label: str) -> bool:
@@ -720,18 +825,18 @@ def choose(rows: "list[tuple[str, Any]]", header: str, footer: str, on_tab=None)
             if pickable:
                 cursor = min(pickable, key=lambda i: (abs(i - cursor), i))
 
-            room = max(3, shutil.get_terminal_size((80, 24)).lines - 3)
+            room = max(3, term_lines() - 3)
             top = 0
             if len(matching) > room:
                 top = max(0, min(cursor - room // 2, len(matching) - room))
             visible = matching[top : top + room]
 
             frame = [f"\033[{drawn}A"] if drawn else []
-            frame.append(f"{header} {query}\033[K\r\n")
+            frame.append(f"{header} {query}\033[K{NEWLINE}")
             for offset, (label, _value) in enumerate(visible):
                 marker = f"{GREEN}{BOLD}>{OFF}" if top + offset == cursor else " "
-                frame.append(f"{marker} {label}\033[K\r\n")
-            frame.append(f"{DIM}{status or footer}{OFF}\033[K\r\n\033[J")
+                frame.append(f"{marker} {label}\033[K{NEWLINE}")
+            frame.append(f"{DIM}{status or footer}{OFF}\033[K{NEWLINE}\033[J")
             sys.stdout.write("".join(frame))
             sys.stdout.flush()
             drawn = len(visible) + 2
@@ -739,16 +844,16 @@ def choose(rows: "list[tuple[str, Any]]", header: str, footer: str, on_tab=None)
             key = read_key()
             if key == "\t" and on_tab and pickable:
                 status = "refreshing..."
-                sys.stdout.write(f"\033[1A{DIM}{status}{OFF}\033[K\r\n\033[J")
+                sys.stdout.write(f"\033[1A{DIM}{status}{OFF}\033[K{NEWLINE}\033[J")
                 sys.stdout.flush()
                 rows, status = on_tab(matching[cursor][1])
                 continue
             status = ""
             if key in ("\x03", "esc"):
-                sys.stdout.write("\r\n")
+                sys.stdout.write(NEWLINE)
                 return None
             if key in ("\r", "\n"):
-                sys.stdout.write("\r\n")
+                sys.stdout.write(NEWLINE)
                 return matching[cursor][1] if pickable else None
             if key == "up":
                 cursor = next((i for i in reversed(pickable) if i < cursor), cursor)
@@ -756,7 +861,7 @@ def choose(rows: "list[tuple[str, Any]]", header: str, footer: str, on_tab=None)
                 cursor = next((i for i in pickable if i > cursor), cursor)
             elif key in ("\x7f", "\b"):
                 query = query[:-1]
-            elif key.isprintable():
+            elif key and key.isprintable():
                 query, cursor = query + key, 0
 
 
@@ -779,11 +884,10 @@ def cmd_status(*_: str) -> None:
         print("no saved accounts yet - run `cxa login`")
         return
     current, favourite = active_id(), best_first(accounts)[0].name
-    names = max([len(a.name) for a in accounts] + [7])
-    mails = max([len(a.email) for a in accounts] + [5])
-    plans = max([len(a.plan) for a in accounts] + [4])
+    names, mails, plans = name_columns(accounts, trailing=8 + 11)
 
-    labels = f"  {pad('account', names)}  {pad('email', mails)}  {pad('plan', plans)}  "
+    email_label = f"{pad('email', mails)}  " if mails else ""
+    labels = f"  {pad('account', names)}  {email_label}{pad('plan', plans)}  "
     print(f"{DIM}{' ' * len(labels)}{USAGE_HEADINGS[0]}{OFF}")
     print(f"{DIM}{labels}{USAGE_HEADINGS[1]}  {pad('role', 8)}seen{OFF}")
     for account in accounts:
@@ -795,7 +899,8 @@ def cmd_status(*_: str) -> None:
         else:
             mark = " "
         seen = last_seen(limits_for(account.name).observed_at)
-        print(f"{mark} {pad(account.name, names)}  {DIM}{pad(account.email, mails)}  "
+        email = f"{pad(account.email, mails)}  " if mails else ""
+        print(f"{mark} {pad(account.name, names)}  {DIM}{email}"
               f"{pad(account.plan, plans)}{OFF}  {short}  {long}  "
               f"{reset_credits(account.name)}  "
               f"{pad(TIER_LABELS[tier(account.name)], 8)}{DIM}{seen}{OFF}".rstrip())
@@ -832,19 +937,18 @@ def cmd_menu() -> None:
     def build() -> "list[tuple[str, Any]]":
         """One table of accounts, then the actions - both on the same left edge."""
         current, accounts = active_id(), list_accounts()
-        names = max([len(a.name) for a in accounts] + [7])
-        mails = max([len(a.email) for a in accounts] + [5])
-        plans = max([len(a.plan) for a in accounts] + [4])
+        names, mails, plans = name_columns(accounts)
 
         def account_row(account: Account) -> str:
             short, long = usage_cells(account.name)
             live = account.account_id == current
             mark, name = (f"{GREEN}*{OFF}", BOLD) if live else (" ", "")
             return (f"{mark} {name}{pad(account.name, names)}{OFF if name else ''}  "
-                    f"{DIM}{pad(account.email, mails)}  {pad(account.plan, plans)}{OFF}  "
+                    f"{DIM}{pad(account.email, mails) + '  ' if mails else ''}"
+                    f"{pad(account.plan, plans)}{OFF}  "
                     f"{short}  {long}  {reset_credits(account.name)}".rstrip())
 
-        indent = "  " + " " * (names + mails + plans + 6)
+        indent = "  " + " " * (names + mails + plans + (6 if mails else 4))
         rows: "list[tuple[str, Any]]" = (
             [(f"{DIM}{indent}{line}{OFF}", None) for line in USAGE_HEADINGS]
             if accounts else []
