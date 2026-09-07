@@ -362,6 +362,11 @@ class Window(NamedTuple):
     def known(self) -> bool:
         return self.percent is not None
 
+    @property
+    def left(self) -> float:
+        """Headroom, the way Codex itself reports it - the logs count upwards."""
+        return 100.0 - (self.percent or 0.0)
+
 
 class Limits(NamedTuple):
     short: Window
@@ -581,23 +586,28 @@ def window_label(minutes: "int | None") -> str:
     return f"{minutes // 60}h" if minutes >= 60 else f"{minutes}m"
 
 
-def percent_color(percent: float) -> str:
-    return GREEN if percent < 50 else (YELLOW if percent < 90 else RED)
+def headroom_color(left: float) -> str:
+    return RED if left < 10 else (YELLOW if left < 35 else GREEN)
+
+
+def format_reset(resets_at: "int | None") -> str:
+    """A countdown while it is close, a calendar day once it is not."""
+    if not resets_at:
+        return ""
+    if resets_at - time.time() < 86400:
+        return format_countdown(resets_at)
+    return time.strftime("%b %-d", time.localtime(resets_at))
 
 
 def usage_summary(name: str) -> str:
-    """One-line usage for the picker, e.g. `5h 12% · wk 41% resets 3h 9m`."""
-    limits = limits_for(name)
+    """One-line headroom for messages, e.g. `5h 88% left · wk 59% left`."""
     parts = [
-        f"{DIM}{window_label(w.minutes)}{OFF} {percent_color(w.percent)}{w.percent:.0f}%{OFF}"
-        for w in limits.windows
+        f"{DIM}{window_label(w.minutes)}{OFF} "
+        f"{headroom_color(w.left)}{w.left:.0f}%{OFF} {DIM}left{OFF}"
+        for w in limits_for(name).windows
         if w.known
     ]
-    if not parts:
-        return f"{DIM}no data yet{OFF}"
-    line = f" {DIM}·{OFF} ".join(parts)
-    countdown = format_countdown(limits.next_reset)
-    return f"{line} {DIM}resets {countdown}{OFF}" if countdown else line
+    return f" {DIM}\u00b7{OFF} ".join(parts) if parts else f"{DIM}no data yet{OFF}"
 
 
 def pad(text: str, width: int, right: bool = False) -> str:
@@ -606,17 +616,33 @@ def pad(text: str, width: int, right: bool = False) -> str:
     return space + text if right else text + space
 
 
-def usage_cells(name: str) -> "tuple[str, str, str, str]":
-    """The four aligned columns behind an account: 5h, weekly, reset, credits."""
-    limits = limits_for(name)
-    short, long = (
-        f"{percent_color(w.percent)}{w.percent:.0f}%{OFF}" if w.known else f"{DIM}-{OFF}"
-        for w in limits.windows
-    )
-    countdown = format_countdown(limits.next_reset)
+#: `left` and `resets` for one window, then the same for the other.
+GROUP = 4 + 2 + 7
+
+
+def usage_cells(name: str) -> "tuple[str, str]":
+    """Each window as `left  resets`, in the same shape as the Codex usage panel."""
+    cells = []
+    for window in limits_for(name).windows:
+        left = (f"{headroom_color(window.left)}{window.left:.0f}%{OFF}"
+                if window.known else f"{DIM}-{OFF}")
+        cells.append(f"{pad(left, 4, right=True)}  "
+                     f"{pad(DIM + format_reset(window.resets_at) + OFF, 7)}")
+    return cells[0], cells[1]
+
+
+#: The two header lines over the usage columns; callers supply the left-hand
+#: labels, which is why these carry no indent of their own.
+USAGE_HEADINGS = (
+    f"{pad('5h', GROUP)}  {pad('weekly', GROUP)}",
+    f"{pad('left', 4, right=True)}  {pad('resets', 7)}  "
+    f"{pad('left', 4, right=True)}  {pad('resets', 7)}",
+)
+
+
+def reset_credits(name: str) -> str:
     left = read_meta(name).get("resets_left")
-    credits = f"{YELLOW}+{left} reset{OFF}" if isinstance(left, int) and left > 0 else ""
-    return short, long, f"{DIM}{countdown}{OFF}" if countdown else "", credits
+    return f"{YELLOW}+{left} reset{OFF}" if isinstance(left, int) and left > 0 else ""
 
 
 def last_seen(observed_at: "int | None") -> str:
@@ -740,11 +766,11 @@ def cmd_status(*_: str) -> None:
     mails = max([len(a.email) for a in accounts] + [5])
     plans = max([len(a.plan) for a in accounts] + [4])
 
-    print(f"{DIM}  {pad('account', names)}  {pad('email', mails)}  {pad('plan', plans)}  "
-          f"{pad('5h', 4, right=True)}  {pad('week', 4, right=True)}  {pad('reset', 7)}  "
-          f"{pad('role', 8)}seen{OFF}")
+    labels = f"  {pad('account', names)}  {pad('email', mails)}  {pad('plan', plans)}  "
+    print(f"{DIM}{' ' * len(labels)}{USAGE_HEADINGS[0]}{OFF}")
+    print(f"{DIM}{labels}{USAGE_HEADINGS[1]}  {pad('role', 8)}seen{OFF}")
     for account in accounts:
-        short, long, countdown, credits = usage_cells(account.name)
+        short, long = usage_cells(account.name)
         if account.account_id and account.account_id == current:
             mark = f"{GREEN}*{OFF}"
         elif account.name == favourite:
@@ -753,12 +779,13 @@ def cmd_status(*_: str) -> None:
             mark = " "
         seen = last_seen(limits_for(account.name).observed_at)
         print(f"{mark} {pad(account.name, names)}  {DIM}{pad(account.email, mails)}  "
-              f"{pad(account.plan, plans)}{OFF}  {pad(short, 4, right=True)}  "
-              f"{pad(long, 4, right=True)}  {pad(countdown or f'{DIM}-{OFF}', 7)}  "
-              f"{pad(TIER_LABELS[tier(account.name)], 8)}{DIM}{seen}{OFF}  {credits}".rstrip())
-    print(f"{DIM}  * active   ~ next up   |  5h accounts are spent first; a weekly-only "
-          f"account is held in reserve.\n"
-          f"  `cxa sync` refreshes these from ChatGPT; tab does one line in the menu.{OFF}")
+              f"{pad(account.plan, plans)}{OFF}  {short}  {long}  "
+              f"{pad(TIER_LABELS[tier(account.name)], 8)}{DIM}{seen}{OFF}  "
+              f"{reset_credits(account.name)}".rstrip())
+    print(f"{DIM}  * active   ~ next up   |   percentages are what is LEFT, not what "
+          f"you used\n"
+          f"  a 5h window is spent before a weekly-only account, which is held in reserve\n"
+          f"  `cxa sync` refreshes these from ChatGPT; tab does one line in the menu{OFF}")
 
 
 def cmd_auto(*_: str) -> None:
@@ -793,18 +820,18 @@ def cmd_menu() -> None:
         plans = max([len(a.plan) for a in accounts] + [4])
 
         def account_row(account: Account) -> str:
-            short, long, countdown, credits = usage_cells(account.name)
+            short, long = usage_cells(account.name)
             live = account.account_id == current
             mark, name = (f"{GREEN}*{OFF}", BOLD) if live else (" ", "")
             return (f"{mark} {name}{pad(account.name, names)}{OFF if name else ''}  "
                     f"{DIM}{pad(account.email, mails)}  {pad(account.plan, plans)}{OFF}  "
-                    f"{pad(short, 4, right=True)}  {pad(long, 4, right=True)}  "
-                    f"{pad(countdown, 7)}  {credits}".rstrip())
+                    f"{short}  {long}  {reset_credits(account.name)}".rstrip())
 
-        heading = (f"{DIM}  {pad('', names)}  {pad('', mails)}  {pad('', plans)}  "
-                   f"{pad('5h', 4, right=True)}  {pad('week', 4, right=True)}  reset{OFF}")
-
-        rows: "list[tuple[str, Any]]" = [(heading, None)] if accounts else []
+        indent = "  " + " " * (names + mails + plans + 6)
+        rows: "list[tuple[str, Any]]" = (
+            [(f"{DIM}{indent}{line}{OFF}", None) for line in USAGE_HEADINGS]
+            if accounts else []
+        )
         rows += [(account_row(a), ("use", a.name)) for a in accounts]
 
         actions = []

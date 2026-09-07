@@ -8,22 +8,26 @@ and never needs `codex logout`.
 
 ```
 $ cxa status
-  account       email                     5h    weekly  next reset  resets   role     seen
-~ work          you@example.com           98%   41%     3h 30m      -                 1h ago
-* spare         other@example.com         -     57%     5d 12h      1·10/05  reserve  11m ago
-  * active   ~ next up
+                                                5h             weekly
+  account       email                     plan  left  resets   left  resets   role      seen
+~ work          you@example.com           plus    2%  3h 30m    59%  Sep 13             1h ago
+* spare         other@example.com         plus     -             43%  Sep 15   reserve  11m ago
+  * active   ~ next up   |   percentages are what is LEFT, not what you used
 ```
 
 ```
 $ cxa
-codex account
-> * work    you@example.com     plus   5h 98% · wk 41% resets 3h 30m
-    spare   other@example.com   plus   wk 57% resets 5d 12h
+codex accounts
+                                          5h             weekly
+                                          left  resets   left  resets
+> * work    you@example.com     plus        2%  3h 30m    59%  Sep 13
+    spare   other@example.com   plus         -             43%  Sep 15
   ~ rotate to the account with the most headroom
+  s refresh every account from ChatGPT
   o mark an account as reset
   + log in to a new account
   x delete an account
-type to search, up/down, enter, esc
+type to search  ·  tab refreshes a line  ·  enter switches  ·  esc quits
 ```
 
 ## Install
@@ -59,6 +63,18 @@ browser signs you straight back into the account you are already using.
 
 In the menu, **Tab** refreshes whatever line you are sitting on without leaving it.
 
+Every percentage in `cxa` is what is **left**, matching the Codex usage panel — `0%` means that
+window is used up, not untouched. Each window carries its own reset, as a countdown while it is
+close and a date once it is not:
+
+```
+                                                5h             weekly
+  account       email                     plan  left  resets   left  resets   role    seen
+  kotook.ae     kotook.ae@gmail.com       team    0%  3h 18m    58%  Sep 13   spent   10m ago
+* main          kamusumawola26@gmail.com  plus   32%  2h 55m     0%  Sep 12   spent   4m ago
+~ peykan.yavuz  peykan.yavuz@aloovpn.com  plus     -             0%  Sep 14   spent   4m ago
+```
+
 ## How the usage numbers work
 
 Codex records its rate-limit windows in its own session logs under `~/.codex/sessions`:
@@ -75,6 +91,9 @@ reads. Two details make this harder than it looks:
   attributes each observation to whichever account was active at that moment.
 - **`primary` is not always the short window.** On one account `primary` is the 5-hour window;
   on another it is the weekly one. `cxa` sorts windows by `window_minutes`, never by key name.
+- **The logs count upwards, the Codex usage panel counts downwards.** `used_percent: 68` is the
+  same thing the panel shows as `32%`. `cxa` displays headroom under a `left` heading, so its
+  numbers can be read straight against the panel.
 
 This part is entirely offline — it only reads and copies local files.
 
